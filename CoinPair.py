@@ -1,12 +1,12 @@
 import json
-import threading
 import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
 from tkinter import font, ttk
-
 import requests
 import websocket
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 
 class ProfileQuote:
@@ -18,7 +18,7 @@ class ProfileQuote:
                           'bitget': {'a': {}, 'b': {}}}
         self.ws = {}
 
-    def initialize_exchange(self, exchange):
+    async def initialize_exchange(self, exchange):
         config = {
             'binance': {
                 'url': f"wss://fstream.binance.com/ws/{self.name.lower()}@depth5@100ms",
@@ -38,16 +38,26 @@ class ProfileQuote:
             }
         }
         if exchange in config:
-            self.initialize_websockets(exchange, **config[exchange])
+            await self.initialize_websockets(exchange, **config[exchange])
 
-    def initialize_websockets(self, exchange, url, on_open_payload=None):
+    async def initialize_websockets(self, exchange, url, on_open_payload=None):
+        def on_close(ws):
+            print(f'{exchange} websocket closed, reconnecting...')
+            time.sleep(1)  # Avoid rapid reconnection
+            asyncio.run(self.initialize_websockets(
+                exchange, url, on_open_payload))
+
         self.ws[exchange] = websocket.WebSocketApp(
-            url, on_message=lambda ws, message: self.on_message(exchange, ws, message))
-        if on_open_payload:
-            self.ws[exchange].on_open = lambda ws: ws.send(
-                json.dumps(on_open_payload))
+            url,
+            on_open=lambda ws: ws.send(json.dumps(
+                on_open_payload)) if on_open_payload else None,
+            on_message=lambda ws, message: self.on_message(
+                exchange, ws, message),
+            on_close=on_close  # Add this line to handle websocket close event
+        )
         threading.Thread(target=self.ws[exchange].run_forever).start()
-        if exchange == 'mexc':
+
+        if exchange == 'mexc' or exchange == 'bitget':
             threading.Thread(target=self.send_heartbeat,
                              args=(exchange,), daemon=True).start()
 
@@ -55,9 +65,13 @@ class ProfileQuote:
         while True:
             time.sleep(10)
             try:
-                self.ws[exchange].send(json.dumps({"method": "ping"}))
+                if exchange == 'mexc':
+                    self.ws[exchange].send(json.dumps({"method": "ping"}))
+                elif exchange == 'bitget':
+                    self.ws[exchange].send("ping")
+
             except websocket.WebSocketConnectionClosedException:
-                self.initialize_exchange(exchange)
+                asyncio.run(self.initialize_exchange(exchange))
 
     def update_tree(self):
         bid_prices = {exchange: float(
@@ -119,10 +133,16 @@ class ProfileQuote:
                 self.orderbook[exchange]['b'][price] = qty
 
 
-def get_filtered_pairs(min_volume):
-    response = requests.get(
-        "https://fapi.binance.com/fapi/v1/ticker/24hr")
-    return [info['symbol'] for info in response.json() if float(info['quoteVolume']) > min_volume]
+def get_usdt_future_trading_pairs_binance():
+    response = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo")
+    data = json.loads(response.text)
+    return [pair['symbol'] for pair in data['symbols'] if pair['quoteAsset'] == 'USDT']
+
+
+def filter_pairs_by_volume(pairs, min_volume):
+    response = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr")
+    data = json.loads(response.text)
+    return [info['symbol'] for info in data if info['symbol'] in pairs and float(info['quoteVolume']) > min_volume]
 
 
 def setup_treeview_style():
@@ -137,12 +157,11 @@ def setup_treeview_style():
     style.map("Treeview", foreground=[("selected", "white")])
 
 
-def main():
+async def main():
     root = tk.Tk()
     root.title("Trading Pairs Price Difference")
     root.grid_rowconfigure(0, weight=1)
     root.grid_columnconfigure(0, weight=1)
-
     setup_treeview_style()
     customFont = font.Font(family="Helvetica", size=16)
     tree = ttk.Treeview(root, columns=("Pair", "Binance",
@@ -159,14 +178,14 @@ def main():
     tree.grid(row=0, column=0, sticky='news')
 
     with ThreadPoolExecutor(max_workers=10) as executor:
-        filtered_pairs = get_filtered_pairs(min_volume=100000000)
-        for symbol in filtered_pairs:
+        pairs = get_usdt_future_trading_pairs_binance()
+        high_volume_pairs = filter_pairs_by_volume(pairs, 100000000)
+        for symbol in high_volume_pairs:
             profile_quote = ProfileQuote(symbol, tree)
-            executor.map(profile_quote.initialize_exchange, [
-                         "binance", "mexc", "bybit", "bitget"])
+            await asyncio.gather(*(profile_quote.initialize_exchange(exchange) for exchange in ["binance", "mexc", "bybit", "bitget"]))
 
     root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
